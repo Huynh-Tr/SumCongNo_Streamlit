@@ -120,6 +120,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Initialize session state for processed DataFrame
+if "df_processed" not in st.session_state:
+    st.session_state.df_processed = None
+
 def clean_empty_rows_and_columns(df):
     """
     Remove completely empty rows and columns, and rows/columns with mostly null values.
@@ -163,6 +167,20 @@ def simplify_dataframe(df):
     # Rename columns to simple numeric names
     df.columns = [f'Col_{i}' for i in range(len(df.columns))]
     
+    return df
+
+def convert_numeric_columns(df):
+    """
+    Try to convert object columns to numeric where it makes sense.
+    This helps expose more columns in the numeric 'sum' selections.
+    """
+    for col in df.columns:
+        if df[col].dtype == object:
+            # Attempt numeric conversion
+            converted = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+            # If at least 50% of non-null values become numeric, keep conversion
+            if converted.notna().sum() >= 0.5 * df[col].notna().sum() and converted.notna().sum() > 0:
+                df[col] = converted
     return df
 
 def parse_pasted_data(text):
@@ -224,11 +242,8 @@ def create_custom_summary(df, groupby_cols, sum_cols, calc_col1=None, calc_col2=
     
     return summary
 
-# Main tabs for input method
+# Main tabs for input method (Upload vs Paste)
 input_tab1, input_tab2 = st.tabs(["📁 Upload", "📋 Paste"])
-
-# Initialize processed dataframe
-df_processed = None
 
 with input_tab1:
     # File uploader
@@ -254,9 +269,12 @@ with input_tab1:
                 
                 # Simplify DataFrame - remove empty columns and rename
                 df = simplify_dataframe(df)
+
+                # Try to convert numeric-like columns
+                df = convert_numeric_columns(df)
                 
-                # Set processed dataframe
-                df_processed = df
+                # Store in session state so it can be reused across interactions
+                st.session_state.df_processed = df
                 
                 # Simple success message
                 st.success(f"✅ {len(df)} rows • {len(df.columns)} columns")
@@ -285,16 +303,22 @@ with input_tab2:
                 
                 # Simplify DataFrame
                 df = simplify_dataframe(df)
+
+                # Try to convert numeric-like columns
+                df = convert_numeric_columns(df)
                 
-                # Set processed dataframe
-                df_processed = df
+                # Store in session state so it can be reused across interactions
+                st.session_state.df_processed = df
                 
                 # Success message
                 st.success(f"✅ {len(df)} rows • {len(df.columns)} columns")
         else:
             st.warning("⚠️ Please paste some data first")
 
-# Display data if processed
+# Read processed DataFrame from session state
+df_processed = st.session_state.df_processed
+
+# Display data if processed (from upload or paste)
 if df_processed is not None:
     # Create tabs for data view
     tab1, tab2 = st.tabs(["📄 Raw Data", "📊 Custom Summary"])
