@@ -187,21 +187,57 @@ def parse_pasted_data(text):
     """
     Parse pasted text data into DataFrame.
     Supports: tab-separated, comma-separated, or space-separated.
+    Pre-processes numbers: replace ',' with '.' and remove '.' thousand separators
     Returns: DataFrame or None if parsing fails
     """
     if not text or not text.strip():
         return None
     
     try:
+        # Pre-process text to normalize numbers:
+        # Replace comma (,) decimal separator with dot (.)
+        # Remove dot (.) thousand separator
+        lines = text.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            # For each line, process potential numeric values
+            # Replace patterns like 1.234,56 -> 1234.56
+            # This handles European number format
+            parts = line.split('\t') if '\t' in line else (line.split(',') if ',' in line else line.split())
+            cleaned_parts = []
+            for part in parts:
+                # If part looks like a number with . and ,
+                if '.' in part and ',' in part:
+                    # Assume . is thousand separator and , is decimal
+                    cleaned_part = part.replace('.', '').replace(',', '.')
+                elif ',' in part:
+                    # Only comma, assume it's decimal separator
+                    cleaned_part = part.replace(',', '.')
+                else:
+                    cleaned_part = part
+                cleaned_parts.append(cleaned_part)
+            
+            # Reconstruct line with original separator
+            if '\t' in line:
+                cleaned_lines.append('\t'.join(cleaned_parts))
+            elif ',' in line and len(parts) > 1:
+                # Be careful: if comma was separator, keep it
+                # But we already split by it, so use tab instead
+                cleaned_lines.append('\t'.join(cleaned_parts))
+            else:
+                cleaned_lines.append(' '.join(cleaned_parts))
+        
+        cleaned_text = '\n'.join(cleaned_lines)
+        
         # Try tab-separated first (most common from Excel copy)
-        if '\t' in text:
-            df = pd.read_csv(StringIO(text), sep='\t', header=None)
+        if '\t' in cleaned_text:
+            df = pd.read_csv(StringIO(cleaned_text), sep='\t', header=None)
         # Try comma-separated
-        elif ',' in text:
-            df = pd.read_csv(StringIO(text), sep=',', header=None)
+        elif ',' in cleaned_text:
+            df = pd.read_csv(StringIO(cleaned_text), sep=',', header=None)
         # Try space/whitespace separated
         else:
-            df = pd.read_csv(StringIO(text), sep=r'\s+', header=None, engine='python')
+            df = pd.read_csv(StringIO(cleaned_text), sep=r'\s+', header=None, engine='python')
         
         return df if not df.empty else None
     except Exception as e:
