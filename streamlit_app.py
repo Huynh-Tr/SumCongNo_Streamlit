@@ -456,7 +456,7 @@ if df_processed is not None:
                         for idx, col in enumerate(sum_cols):
                             with cols[idx]:
                                 total = summary_df[col].sum()
-                                st.metric(col, f"{total:,.0f}")
+                                st.metric(col, f"{total:,.2f}")
 else:
     st.info("👆 Upload a file or paste data to begin")
 
