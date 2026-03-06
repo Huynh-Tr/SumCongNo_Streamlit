@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO, StringIO
 import numpy as np
+import re
 
 # Configure the page
 st.set_page_config(
@@ -129,41 +130,41 @@ def clean_empty_rows_and_columns(df):
     Remove completely empty rows and columns, and rows/columns with mostly null values.
     Returns: cleaned DataFrame
     """
+    if df is None or df.empty:
+        return df
+
     # Calculate null threshold (80% or more nulls = remove)
     null_threshold = 0.8
-    
+
     # Remove rows with too many nulls
-    row_null_ratio = df.isna().sum(axis=1) / len(df.columns)
-    df = df[row_null_ratio < null_threshold].reset_index(drop=True)
-    
-    # Remove completely empty columns
-    col_null_ratio = df.isna().sum(axis=0) / len(df)
-    df = df.loc[:, col_null_ratio < 1.0]
-    
-    # Remove leading empty rows (rows before first row with significant data)
-    for idx in range(len(df)):
-        if df.iloc[idx].notna().sum() >= 3:  # At least 3 non-null values
-            df = df.iloc[idx:].reset_index(drop=True)
-            break
-    
-    # Remove trailing empty rows
-    for idx in range(len(df)-1, -1, -1):
-        if df.iloc[idx].notna().sum() >= 3:  # At least 3 non-null values
-            df = df.iloc[:idx+1].reset_index(drop=True)
-            break
-    
+    row_null_ratio = df.isna().mean(axis=1)
+    df = df.loc[row_null_ratio < null_threshold].reset_index(drop=True)
+    if df.empty:
+        return df
+
+    # Remove completely empty columns (after row filtering)
+    df = df.loc[:, df.notna().any()]
+    if df.empty:
+        return df
+
+    # Remove leading/trailing sparse rows (faster than python loops)
+    non_null_counts = df.notna().sum(axis=1).to_numpy()
+    keep_mask = non_null_counts >= 3
+    if keep_mask.any():
+        first = int(np.argmax(keep_mask))
+        last = int(len(keep_mask) - 1 - np.argmax(keep_mask[::-1]))
+        df = df.iloc[first:last + 1].reset_index(drop=True)
+
+    # Remove completely empty columns again after trimming
+    df = df.loc[:, df.notna().any()]
     return df
 
 def simplify_dataframe(df):
     """
     Simplify DataFrame by:
-    1. Removing completely empty columns
-    2. Naming columns as Col_0, Col_1, etc.
+    1. Naming columns as Col_0, Col_1, etc.
     Returns: simplified DataFrame
     """
-    # Remove completely empty columns
-    df = df.loc[:, df.notna().any()]
-    
     # Rename columns to simple numeric names
     df.columns = [f'Col_{i}' for i in range(len(df.columns))]
     
@@ -176,56 +177,151 @@ def convert_numeric_columns(df):
     """
     for col in df.columns:
         if df[col].dtype == object:
+            non_null_count = int(df[col].notna().sum())
+            if non_null_count == 0:
+                continue
+
+            sample = df[col].dropna().astype(str).head(30)
+            if not sample.str.contains(r"\d", regex=True).any():
+                continue
+
             # Attempt numeric conversion
-            converted = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+            raw = df[col].astype(str).str.replace(',', '', regex=False)
+            converted = pd.to_numeric(raw, errors='coerce')
             # If at least 50% of non-null values become numeric, keep conversion
-            if converted.notna().sum() >= 0.5 * df[col].notna().sum() and converted.notna().sum() > 0:
+            converted_count = int(converted.notna().sum())
+            if converted_count >= 0.5 * non_null_count and converted_count > 0:
                 df[col] = converted
     return df
+
+_THOUSANDS_COMMA_RE = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
+_THOUSANDS_DOT_RE = re.compile(r"^[+-]?\d{1,3}(?:\.\d{3})+(?:,\d+)?$")
+_ONLY_THOUSANDS_COMMA_RE = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})+$")
+_ONLY_THOUSANDS_DOT_RE = re.compile(r"^[+-]?\d{1,3}(?:\.\d{3})+$")
+_DECIMAL_COMMA_RE = re.compile(r"^[+-]?\d+(?:,\d+)$")
+
+def _normalize_number_token(token: str) -> str:
+    """
+    Normalize a single token that may represent a number.
+    Examples:
+      - "2,105,000" -> "2105000"
+      - "1.234,56"  -> "1234.56"
+      - "1,234.56"  -> "1234.56"
+    """
+    t = token.strip()
+    if not t:
+        return token
+    if "," not in t and "." not in t:
+        return t
+
+    # Fast-path common thousand separators
+    if _THOUSANDS_COMMA_RE.match(t) or _ONLY_THOUSANDS_COMMA_RE.match(t):
+        return t.replace(",", "")
+    if _THOUSANDS_DOT_RE.match(t) or _ONLY_THOUSANDS_DOT_RE.match(t):
+        return t.replace(".", "").replace(",", ".")
+
+    # Mixed separators: pick the last seen separator as decimal mark.
+    if "," in t and "." in t:
+        if t.rfind(",") > t.rfind("."):
+            # "1.234,56" -> "1234.56"
+            return t.replace(".", "").replace(",", ".")
+        # "1,234.56" -> "1234.56"
+        return t.replace(",", "")
+
+    # Only comma: could be decimal or thousands
+    if "," in t:
+        if _ONLY_THOUSANDS_COMMA_RE.match(t):
+            return t.replace(",", "")
+        if _DECIMAL_COMMA_RE.match(t):
+            return t.replace(",", ".")
+        return t
+
+    # Only dot: could be thousands
+    if "." in t and _ONLY_THOUSANDS_DOT_RE.match(t):
+        return t.replace(".", "")
+
+    return t
+
+def _format_metric_number(value) -> str:
+    if value is None:
+        return ""
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    if not np.isfinite(v):
+        return str(value)
+    if abs(v - round(v)) < 1e-9:
+        return str(int(round(v)))
+    s = f"{v:.6f}".rstrip("0").rstrip(".")
+    return s
+
+def _format_metric_number_grouped(value) -> str:
+    if value is None:
+        return ""
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    if not np.isfinite(v):
+        return str(value)
+    if abs(v - round(v)) < 1e-9:
+        return f"{int(round(v)):,}"
+    s = f"{v:,.6f}".rstrip("0").rstrip(".")
+    return s
+
+def _format_table_number_grouped(value) -> str:
+    if value is None:
+        return ""
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    if not np.isfinite(v):
+        return str(value)
+    if abs(v - round(v)) < 1e-9:
+        return f"{int(round(v)):,}"
+    return f"{v:,.2f}"
 
 def parse_pasted_data(text):
     """
     Parse pasted text data into DataFrame.
     Supports: tab-separated, comma-separated, or space-separated.
-    Pre-processes numbers: replace ',' with '.' and remove '.' thousand separators
+    Pre-processes numbers: handles thousand separators like "2,105,000" -> "2105000"
     Returns: DataFrame or None if parsing fails
     """
     if not text or not text.strip():
         return None
     
     try:
-        # Pre-process text to normalize numbers:
-        # Replace comma (,) decimal separator with dot (.)
-        # Remove dot (.) thousand separator
+        # Pre-process text to normalize numbers without breaking delimiters.
         lines = text.split('\n')
         cleaned_lines = []
         for line in lines:
             # For each line, process potential numeric values
-            # Replace patterns like 1.234,56 -> 1234.56
-            # This handles European number format
-            parts = line.split('\t') if '\t' in line else (line.split(',') if ',' in line else line.split())
+            # - If tab-separated (Excel copy), keep tabs.
+            # - If comma exists, it can be a delimiter or a thousand separator.
+            if '\t' in line:
+                parts = line.split('\t')
+                joiner = '\t'
+            elif ',' in line:
+                # Single numeric value like "2,105,000" should stay as one token.
+                candidate = line.strip()
+                if _THOUSANDS_COMMA_RE.match(candidate) or _ONLY_THOUSANDS_COMMA_RE.match(candidate):
+                    parts = [candidate]
+                    joiner = ' '
+                else:
+                    parts = line.split(',')
+                    # We'll re-join with tab to avoid confusing commas later.
+                    joiner = '\t'
+            else:
+                parts = line.split()
+                joiner = ' '
             cleaned_parts = []
             for part in parts:
-                # If part looks like a number with . and ,
-                if '.' in part and ',' in part:
-                    # Assume . is thousand separator and , is decimal
-                    cleaned_part = part.replace('.', '').replace(',', '.')
-                elif ',' in part:
-                    # Only comma, assume it's decimal separator
-                    cleaned_part = part.replace(',', '.')
-                else:
-                    cleaned_part = part
-                cleaned_parts.append(cleaned_part)
-            
-            # Reconstruct line with original separator
-            if '\t' in line:
-                cleaned_lines.append('\t'.join(cleaned_parts))
-            elif ',' in line and len(parts) > 1:
-                # Be careful: if comma was separator, keep it
-                # But we already split by it, so use tab instead
-                cleaned_lines.append('\t'.join(cleaned_parts))
-            else:
-                cleaned_lines.append(' '.join(cleaned_parts))
+                cleaned_parts.append(_normalize_number_token(part))
+
+            cleaned_lines.append(joiner.join(cleaned_parts))
         
         cleaned_text = '\n'.join(cleaned_lines)
         
@@ -240,8 +336,28 @@ def parse_pasted_data(text):
             df = pd.read_csv(StringIO(cleaned_text), sep=r'\s+', header=None, engine='python')
         
         return df if not df.empty else None
-    except Exception as e:
+    except Exception:
         return None
+
+def _process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = clean_empty_rows_and_columns(df)
+    if df is None or df.empty:
+        return df
+    df = simplify_dataframe(df)
+    df = convert_numeric_columns(df)
+    return df
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
+def _process_uploaded_excel_bytes(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_excel(BytesIO(file_bytes), header=None)
+    return _process_dataframe(df)
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
+def _process_pasted_text(text: str):
+    df = parse_pasted_data(text)
+    if df is None or df.empty:
+        return None
+    return _process_dataframe(df)
 
 def create_custom_summary(df, groupby_cols, sum_cols, calc_col1=None, calc_col2=None):
     """
@@ -291,24 +407,11 @@ with input_tab1:
     
     if uploaded_file is not None:
         try:
-            # Read the Excel file without headers
-            df = pd.read_excel(uploaded_file, header=None)
+            df = _process_uploaded_excel_bytes(uploaded_file.getvalue())
             
-            if df.empty:
+            if df is None or df.empty:
                 st.error("❌ The uploaded file is empty!")
             else:
-                # Show original dimensions
-                original_shape = df.shape
-                
-                # Clean empty rows and columns
-                df = clean_empty_rows_and_columns(df)
-                
-                # Simplify DataFrame - remove empty columns and rename
-                df = simplify_dataframe(df)
-
-                # Try to convert numeric-like columns
-                df = convert_numeric_columns(df)
-                
                 # Store in session state so it can be reused across interactions
                 st.session_state.df_processed = df
                 
@@ -329,20 +432,11 @@ with input_tab2:
     
     if st.button("✨ Process", type="primary", use_container_width=True):
         if pasted_text:
-            df = parse_pasted_data(pasted_text)
+            df = _process_pasted_text(pasted_text)
             
             if df is None:
                 st.error("❌ Could not parse the data. Make sure it's properly formatted.")
             else:
-                # Clean empty rows and columns
-                df = clean_empty_rows_and_columns(df)
-                
-                # Simplify DataFrame
-                df = simplify_dataframe(df)
-
-                # Try to convert numeric-like columns
-                df = convert_numeric_columns(df)
-                
                 # Store in session state so it can be reused across interactions
                 st.session_state.df_processed = df
                 
@@ -385,7 +479,7 @@ if df_processed is not None:
                     total = df_processed[selected_col].sum()
                     st.metric(
                         label="Total",
-                        value=f"{total:,.2f}",
+                        value=_format_metric_number(total),
                         delta=None
                     )
     
@@ -448,7 +542,17 @@ if df_processed is not None:
                 
                 if summary_df is not None:
                     st.divider()
-                    st.dataframe(summary_df, use_container_width=True, height=350)
+                    calc_col_name = (
+                        f"{calc_col1}_div_{calc_col2}" if calc_col1 and calc_col2 else None
+                    )
+                    display_format_cols = [c for c in (sum_cols + ([calc_col_name] if calc_col_name else [])) if c in summary_df.columns]
+                    if display_format_cols:
+                        styled = summary_df.style.format(
+                            {c: _format_table_number_grouped for c in display_format_cols}
+                        )
+                        st.dataframe(styled, use_container_width=True, height=350)
+                    else:
+                        st.dataframe(summary_df, use_container_width=True, height=350)
                     
                     # Simple totals
                     if len(sum_cols) <= 3:
@@ -456,7 +560,7 @@ if df_processed is not None:
                         for idx, col in enumerate(sum_cols):
                             with cols[idx]:
                                 total = summary_df[col].sum()
-                                st.metric(col, f"{total:,.2f}")
+                                st.metric(col, _format_metric_number_grouped(total))
 else:
     st.info("👆 Upload a file or paste data to begin")
 
