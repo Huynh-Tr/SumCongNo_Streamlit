@@ -359,40 +359,72 @@ def _process_pasted_text(text: str):
         return None
     return _process_dataframe(df)
 
-def create_custom_summary(df, groupby_cols, sum_cols, calc_col1=None, calc_col2=None):
+# Default column indices (0-based) used for the automatic summary.
+NAME_COL_IDX = 2    # cột 2 -> Tên hàng
+QTY_COL_IDX = 4     # cột 4 -> Số lượng
+AMOUNT_COL_IDX = 6  # cột 6 -> Thành tiền
+
+# Display order of the summary table columns.
+SUMMARY_COLUMNS = ['Tên hàng', 'Số lượng', 'Đơn giá', 'Thành tiền']
+SUMMARY_NUMERIC_COLUMNS = ['Số lượng', 'Đơn giá', 'Thành tiền']
+
+def create_auto_summary(df, name_idx=NAME_COL_IDX, qty_idx=QTY_COL_IDX, amount_idx=AMOUNT_COL_IDX):
     """
-    Create a custom summary based on user-selected columns.
-    
-    Args:
-        df: DataFrame
-        groupby_cols: List of columns to group by
-        sum_cols: List of columns to sum
-        calc_col1: Optional - numerator column for calculated column
-        calc_col2: Optional - denominator column for calculated column
-    
+    Build the automatic summary used in the Summarize tab.
+
+    Flow:
+      - Group by `name_idx`   (Tên hàng)
+      - Sum `qty_idx`         (Số lượng)
+      - Sum `amount_idx`      (Thành tiền)
+      - Add a calculated column Đơn giá = Thành tiền / Số lượng
+
+    Column order in the result: Tên hàng, Số lượng, Đơn giá, Thành tiền.
+
     Returns:
-        summary DataFrame
+        summary DataFrame, or None if the data doesn't have the required columns.
     """
-    if not groupby_cols or not sum_cols:
+    if df is None or df.empty:
         return None
-    
-    # Create aggregation dictionary
-    agg_dict = {col: 'sum' for col in sum_cols}
-    
-    # Group and aggregate
-    summary = df.groupby(groupby_cols).agg(agg_dict).reset_index()
-    
-    # Create calculated column if requested
-    if calc_col1 and calc_col2 and calc_col1 in sum_cols and calc_col2 in sum_cols:
-        summary[f'{calc_col1}_div_{calc_col2}'] = summary[calc_col1] / summary[calc_col2]
-        summary[f'{calc_col1}_div_{calc_col2}'] = summary[f'{calc_col1}_div_{calc_col2}'].round(2)
-    
-    # Round numeric columns
-    for col in sum_cols:
-        if pd.api.types.is_numeric_dtype(summary[col]):
-            summary[col] = summary[col].round(2)
-    
-    return summary
+
+    n_cols = len(df.columns)
+    if max(name_idx, qty_idx, amount_idx) >= n_cols or min(name_idx, qty_idx, amount_idx) < 0:
+        return None
+
+    name_col = df.columns[name_idx]
+    qty_col = df.columns[qty_idx]
+    amount_col = df.columns[amount_idx]
+
+    work = df[[name_col, qty_col, amount_col]].copy()
+    work.columns = ['Tên hàng', 'Số lượng', 'Thành tiền']
+
+    # Ensure the quantity / amount columns are numeric.
+    work['Số lượng'] = pd.to_numeric(work['Số lượng'], errors='coerce')
+    work['Thành tiền'] = pd.to_numeric(work['Thành tiền'], errors='coerce')
+
+    # Keep only rows that actually have a product name.
+    work = work.dropna(subset=['Tên hàng'])
+    if work.empty:
+        return None
+
+    summary = (
+        work.groupby('Tên hàng', as_index=False)
+        .agg({'Số lượng': 'sum', 'Thành tiền': 'sum'})
+    )
+
+    # Đơn giá = Thành tiền / Số lượng (guard against divide-by-zero).
+    summary['Đơn giá'] = np.where(
+        summary['Số lượng'] != 0,
+        summary['Thành tiền'] / summary['Số lượng'],
+        np.nan,
+    )
+
+    # Round numeric columns for display.
+    summary['Số lượng'] = summary['Số lượng'].round(2)
+    summary['Thành tiền'] = summary['Thành tiền'].round(2)
+    summary['Đơn giá'] = summary['Đơn giá'].round(2)
+
+    # Reorder so Đơn giá comes before Thành tiền.
+    return summary[SUMMARY_COLUMNS]
 
 # Main tabs for input method (Upload vs Paste)
 input_tab1, input_tab2 = st.tabs(["📁 Upload", "📋 Paste"])
@@ -451,7 +483,7 @@ df_processed = st.session_state.df_processed
 # Display data if processed (from upload or paste)
 if df_processed is not None:
     # Create tabs for data view
-    tab1, tab2 = st.tabs(["📄 Raw Data", "📊 Custom Summary"])
+    tab1, tab2 = st.tabs(["📄 Raw Data", "📊 Summarize"])
             
     with tab1:
         # Display the raw dataframe - clean and simple
@@ -484,83 +516,128 @@ if df_processed is not None:
                     )
     
     with tab2:
-        # Get all columns
-        all_cols = df_processed.columns.tolist()
-        numeric_cols = df_processed.select_dtypes(include=[np.number]).columns.tolist()
-        
-        # Group By
-        st.markdown("**📌 Group By**")
-        groupby_cols = st.multiselect(
-            "Select columns",
-            options=all_cols,
-            key='groupby_cols',
-            label_visibility="collapsed"
-        )
-        
-        # Sum
-        st.markdown("**➕ Sum**")
-        sum_cols = st.multiselect(
-            "Select numeric columns",
-            options=numeric_cols,
-            key='sum_cols',
-            label_visibility="collapsed"
-        )
-        
-        # Calculated column
-        calc_col1 = None
-        calc_col2 = None
-        if len(sum_cols) >= 2:
-            st.markdown("**🧮 Calculate (Optional)**")
-            col1, col2 = st.columns(2)
-            with col1:
-                calc_col1 = st.selectbox(
-                    "Numerator",
-                    options=['—'] + sum_cols,
-                    key='calc_col1',
-                    label_visibility="visible"
-                )
-            with col2:
-                calc_col2 = st.selectbox(
-                    "Denominator",
-                    options=['—'] + sum_cols,
-                    key='calc_col2',
-                    label_visibility="visible"
-                )
-            calc_col1 = None if calc_col1 == '—' else calc_col1
-            calc_col2 = None if calc_col2 == '—' else calc_col2
-        
-        # Create button
-        if st.button("✨ Create Summary", type="primary", use_container_width=True):
-            if not groupby_cols:
-                st.warning("Select at least one column to group by")
-            elif not sum_cols:
-                st.warning("Select at least one column to sum")
-            else:
-                summary_df = create_custom_summary(
-                    df_processed, groupby_cols, sum_cols, calc_col1, calc_col2
-                )
-                
-                if summary_df is not None:
-                    st.divider()
-                    calc_col_name = (
-                        f"{calc_col1}_div_{calc_col2}" if calc_col1 and calc_col2 else None
-                    )
-                    display_format_cols = [c for c in (sum_cols + ([calc_col_name] if calc_col_name else [])) if c in summary_df.columns]
-                    if display_format_cols:
-                        styled = summary_df.style.format(
-                            {c: _format_table_number_grouped for c in display_format_cols}
-                        )
-                        st.dataframe(styled, use_container_width=True, height=350)
-                    else:
-                        st.dataframe(summary_df, use_container_width=True, height=350)
-                    
-                    # Simple totals
-                    if len(sum_cols) <= 3:
-                        cols = st.columns(len(sum_cols))
-                        for idx, col in enumerate(sum_cols):
-                            with cols[idx]:
-                                total = summary_df[col].sum()
-                                st.metric(col, _format_metric_number_grouped(total))
+        # Automatic summary:
+        #   - Group by "Tên hàng"
+        #   - Sum "Số lượng" and "Thành tiền"
+        #   - Add Đơn giá = Thành tiền / Số lượng
+        #   - Column order: Tên hàng, Số lượng, Đơn giá, Thành tiền
+        n_data_cols = len(df_processed.columns)
+
+        # Column mapping options. Defaults follow the standard layout but can be
+        # adjusted if the data column order changes.
+        default_name = NAME_COL_IDX if NAME_COL_IDX < n_data_cols else 0
+        default_qty = QTY_COL_IDX if QTY_COL_IDX < n_data_cols else 0
+        default_amount = AMOUNT_COL_IDX if AMOUNT_COL_IDX < n_data_cols else 0
+
+        name_idx = st.session_state.get('map_name_idx', default_name)
+        qty_idx = st.session_state.get('map_qty_idx', default_qty)
+        amount_idx = st.session_state.get('map_amount_idx', default_amount)
+
+        summary_df = create_auto_summary(df_processed, name_idx, qty_idx, amount_idx)
+
+        if summary_df is None:
+            st.warning(
+                "Không tổng hợp được với cấu hình cột hiện tại. "
+                "Hãy mở phần **⚙️ Tùy chỉnh cột** bên dưới để chọn lại cột."
+            )
+        else:
+            styled = (
+                summary_df.style
+                .format({c: _format_table_number_grouped for c in SUMMARY_NUMERIC_COLUMNS})
+                .hide(axis='index')
+                .set_table_styles([
+                    {
+                        'selector': 'th',
+                        'props': [
+                            ('background-color', '#1E3A8A'),
+                            ('color', '#FFFFFF'),
+                            ('font-weight', '700'),
+                            ('text-align', 'center'),
+                            ('padding', '0.5rem 0.75rem'),
+                        ],
+                    },
+                    {
+                        'selector': 'td',
+                        'props': [
+                            ('padding', '0.4rem 0.75rem'),
+                            ('border-bottom', '1px solid #E5E7EB'),
+                        ],
+                    },
+                    {
+                        'selector': 'td:nth-child(1)',
+                        'props': [('text-align', 'left')],
+                    },
+                    {
+                        'selector': 'td:nth-child(n+2)',
+                        'props': [('text-align', 'right')],
+                    },
+                    {
+                        'selector': 'table',
+                        'props': [
+                            ('border-collapse', 'collapse'),
+                            ('width', '100%'),
+                            ('font-size', '0.9rem'),
+                        ],
+                    },
+                ])
+            )
+            # Render as HTML so the dark-blue bold header is guaranteed to show
+            # (st.dataframe's canvas grid ignores header styles).
+            st.markdown(
+                f'<div style="overflow-x:auto;">{styled.to_html()}</div>',
+                unsafe_allow_html=True,
+            )
+
+            st.write("")
+            # Totals
+            total_qty = summary_df['Số lượng'].sum()
+            total_amount = summary_df['Thành tiền'].sum()
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("Tổng số lượng", _format_metric_number_grouped(total_qty))
+            with c2:
+                st.metric("Tổng thành tiền", _format_metric_number_grouped(total_amount))
+
+        # Column adjustment option (for when the data column order changes).
+        st.divider()
+        with st.expander("⚙️ Tùy chỉnh cột"):
+            st.caption(
+                "Chọn lại cột nếu thứ tự dữ liệu thay đổi. "
+                "Số trong ngoặc là vị trí cột (bắt đầu từ 0)."
+            )
+            col_options = list(range(n_data_cols))
+
+            def _col_label(i):
+                # Show a short preview of the column's first non-null value.
+                col = df_processed.columns[i]
+                sample = df_processed[col].dropna()
+                preview = str(sample.iloc[0]) if not sample.empty else ""
+                if len(preview) > 18:
+                    preview = preview[:18] + "…"
+                return f"Cột {i}" + (f" ({preview})" if preview else "")
+
+            st.selectbox(
+                "📌 Tên hàng (group by)",
+                options=col_options,
+                index=name_idx if name_idx < n_data_cols else 0,
+                format_func=_col_label,
+                key='map_name_idx',
+            )
+            st.selectbox(
+                "🔢 Số lượng (sum)",
+                options=col_options,
+                index=qty_idx if qty_idx < n_data_cols else 0,
+                format_func=_col_label,
+                key='map_qty_idx',
+            )
+            st.selectbox(
+                "💰 Thành tiền (sum)",
+                options=col_options,
+                index=amount_idx if amount_idx < n_data_cols else 0,
+                format_func=_col_label,
+                key='map_amount_idx',
+            )
+            st.caption("Đơn giá = Thành tiền / Số lượng (tự động tính).")
 else:
     st.info("👆 Upload a file or paste data to begin")
 
